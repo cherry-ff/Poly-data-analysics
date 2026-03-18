@@ -1,0 +1,23 @@
+{
+  "generated_at": "2026-03-18T10:51:58.244672Z",
+  "records_root": "/private/var/folders/2b/zs5nl4bn035d1yhs99s9pqgc0000gn/T/poly15-e2e-to2ht8o7/records",
+  "market_order": [],
+  "global": {
+    "binance": {
+      "count": 0,
+      "latest": null,
+      "series": []
+    },
+    "chainlink": {
+      "count": 0,
+      "latest": null,
+      "series": []
+    },
+    "basis": {
+      "count": 0,
+      "latest": null,
+      "series": []
+    }
+  },
+  "markets": {}
+}

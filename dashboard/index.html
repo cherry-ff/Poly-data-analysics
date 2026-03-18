@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Poly-15minBTC Data Observatory</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="sidebar-brand">
+          <p class="eyebrow">Poly-15minBTC</p>
+          <h1>Data Observatory</h1>
+          <p class="sidebar-copy">
+            录制数据浏览、市场切换、单市场分析和盘口快照展示。
+          </p>
+        </div>
+
+        <div class="sidebar-block">
+          <label class="control-label" for="market-search">市场检索</label>
+          <input id="market-search" class="search-input" type="search" placeholder="输入 market id" />
+        </div>
+
+        <div class="sidebar-block">
+          <div class="section-label">市场列表</div>
+          <div id="market-list" class="market-list"></div>
+        </div>
+
+        <div class="sidebar-block sidebar-meta">
+          <div class="section-label">数据源</div>
+          <p id="records-root" class="meta-line">-</p>
+          <p id="generated-at" class="meta-line">-</p>
+        </div>
+      </aside>
+
+      <main class="main-content">
+        <header class="hero">
+          <div class="hero-copy">
+            <p class="eyebrow">Recorded Runtime Dashboard</p>
+            <h2>面向策略、报价与市场微观结构的静态分析页</h2>
+            <p>
+              这个页面通过本地 dashboard 服务实时解析 records 数据，重点展示三类内容：
+              外部价格锚、单市场概率与报价关系、生命周期与市场摘要。
+            </p>
+          </div>
+          <div id="global-stats" class="hero-stats"></div>
+        </header>
+
+        <section class="content-grid">
+          <article class="panel panel-wide">
+            <div class="panel-head">
+              <div>
+                <p class="section-label">Selected Market</p>
+                <h3 id="market-title">-</h3>
+              </div>
+              <div id="market-phase-pill" class="phase-pill">-</div>
+            </div>
+            <div id="market-summary" class="stats-grid"></div>
+            <div id="market-facts" class="facts-grid"></div>
+            <div id="lifecycle-strip" class="lifecycle-strip"></div>
+          </article>
+
+          <article class="panel">
+            <div class="panel-head compact">
+              <div>
+                <p class="section-label">Global Price Context</p>
+                <h3>Binance vs Chainlink</h3>
+              </div>
+            </div>
+            <div id="external-chart" class="chart-slot"></div>
+          </article>
+
+          <article class="panel">
+            <div class="panel-head compact">
+              <div>
+                <p class="section-label">Single Market Comparison</p>
+                <h3>Theo / 可买入价</h3>
+              </div>
+            </div>
+            <div id="probability-chart" class="chart-slot"></div>
+          </article>
+
+        </section>
+      </main>
+    </div>
+
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>
