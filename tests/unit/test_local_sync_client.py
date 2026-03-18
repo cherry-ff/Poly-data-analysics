@@ -141,3 +141,24 @@ def test_extract_archive_rejects_symlink_members(tmp_path: Path) -> None:
         assert "unsupported link type" in str(exc)
     else:
         raise AssertionError("symlink members should be rejected during archive extraction")
+
+
+def test_build_sync_batches_respects_byte_and_file_limits() -> None:
+    manifest_entries = {
+        "global/a.jsonl": {"path": "global/a.jsonl", "size_bytes": 50},
+        "global/b.jsonl": {"path": "global/b.jsonl", "size_bytes": 40},
+        "global/c.jsonl": {"path": "global/c.jsonl", "size_bytes": 60},
+        "global/d.jsonl": {"path": "global/d.jsonl", "size_bytes": 10},
+    }
+
+    batches = poly15_sync_client._build_sync_batches(
+        ["global/a.jsonl", "global/b.jsonl", "global/c.jsonl", "global/d.jsonl"],
+        manifest_entries,
+        max_batch_bytes=100,
+        max_batch_files=2,
+    )
+
+    assert batches == [
+        ["global/a.jsonl", "global/b.jsonl"],
+        ["global/c.jsonl", "global/d.jsonl"],
+    ]

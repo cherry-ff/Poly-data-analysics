@@ -5,10 +5,12 @@ import argparse
 import hashlib
 import json
 import os
+import socket
 import shutil
 import sys
 import tarfile
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -22,6 +24,11 @@ DEFAULT_ENV_PATH = SCRIPT_DIR / ".env"
 DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "synced_records"
 DEFAULT_STATE_DIR_NAME = ".poly15_sync_state"
 DEFAULT_TIMEOUT_SECONDS = 60
+DEFAULT_ARCHIVE_TIMEOUT_SECONDS = 1800
+DEFAULT_BATCH_MAX_BYTES = 64 * 1024 * 1024
+DEFAULT_BATCH_MAX_FILES = 64
+DOWNLOAD_CHUNK_SIZE = 1024 * 1024
+UNKNOWN_PROGRESS_REPORT_STEP_BYTES = 8 * 1024 * 1024
 
 
 def _load_env_file(path: Path) -> None:
@@ -42,14 +49,26 @@ class SyncApiError(RuntimeError):
 
 
 class SyncClient:
-    def __init__(self, *, base_url: str, token: str, timeout_seconds: int) -> None:
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        token: str,
+        timeout_seconds: int,
+        archive_timeout_seconds: int,
+    ) -> None:
         self._base_url = base_url.rstrip("/")
         self._token = token.strip()
         self._timeout_seconds = timeout_seconds
+        self._archive_timeout_seconds = archive_timeout_seconds
         if not self._base_url:
             raise SyncApiError("missing POLY15_SYNC_BASE_URL or --base-url")
         if not self._token:
             raise SyncApiError("missing POLY15_SYNC_API_TOKEN or --token")
+        if self._timeout_seconds <= 0:
+            raise SyncApiError("timeout_seconds must be positive")
+        if self._archive_timeout_seconds <= 0:
+            raise SyncApiError("archive_timeout_seconds must be positive")
 
     def manifest(self) -> dict[str, Any]:
         payload = self._request_json("GET", "/api/sync/manifest")
@@ -61,7 +80,14 @@ class SyncClient:
         body = {}
         if paths:
             body["paths"] = paths
-        archive_path, headers = self._request_to_file("POST", "/api/sync/archive", body, suffix=".tar.gz")
+        archive_path, headers = self._request_to_file(
+            "POST",
+            "/api/sync/archive",
+            body,
+            suffix=".tar.gz",
+            progress_label="downloading archive",
+            timeout_seconds=self._archive_timeout_seconds,
+        )
         return archive_path, headers.get("Content-Disposition")
 
     def ack(
@@ -147,10 +173,13 @@ class SyncClient:
         method: str,
         path: str,
         payload: dict[str, Any] | None = None,
+        *,
+        timeout_seconds: int | None = None,
     ) -> tuple[bytes, dict[str, str]]:
         request = self._build_request(method, path, payload)
+        effective_timeout = timeout_seconds or self._timeout_seconds
         try:
-            with urllib.request.urlopen(request, timeout=self._timeout_seconds) as response:
+            with urllib.request.urlopen(request, timeout=effective_timeout) as response:
                 body = response.read()
                 response_headers = {key: value for key, value in response.headers.items()}
                 return body, response_headers
@@ -167,6 +196,10 @@ class SyncClient:
             ) from exc
         except urllib.error.URLError as exc:
             raise SyncApiError(f"{method} {path} failed: {exc}") from exc
+        except (TimeoutError, socket.timeout) as exc:
+            raise SyncApiError(
+                f"{method} {path} timed out after {effective_timeout}s"
+            ) from exc
 
     def _request_to_file(
         self,
@@ -175,8 +208,11 @@ class SyncClient:
         payload: dict[str, Any] | None = None,
         *,
         suffix: str = "",
+        progress_label: str = "",
+        timeout_seconds: int | None = None,
     ) -> tuple[Path, dict[str, str]]:
         request = self._build_request(method, path, payload)
+        effective_timeout = timeout_seconds or self._timeout_seconds
         with tempfile.NamedTemporaryFile(
             prefix="poly15-sync-",
             suffix=suffix,
@@ -184,9 +220,30 @@ class SyncClient:
         ) as handle:
             temp_path = Path(handle.name)
             try:
-                with urllib.request.urlopen(request, timeout=self._timeout_seconds) as response:
-                    shutil.copyfileobj(response, handle, length=1024 * 1024)
+                with urllib.request.urlopen(request, timeout=effective_timeout) as response:
                     response_headers = {key: value for key, value in response.headers.items()}
+                    total_bytes = _safe_int(response_headers.get("Content-Length"))
+                    downloaded_bytes = 0
+                    next_percent = 10
+                    next_unknown_report = 1
+                    while True:
+                        chunk = response.read(DOWNLOAD_CHUNK_SIZE)
+                        if not chunk:
+                            break
+                        handle.write(chunk)
+                        downloaded_bytes += len(chunk)
+                        if not progress_label:
+                            continue
+                        if total_bytes is not None and total_bytes > 0:
+                            current_percent = int(downloaded_bytes * 100 / total_bytes)
+                            while next_percent <= current_percent and next_percent < 100:
+                                _print_progress(progress_label, downloaded_bytes, total_bytes)
+                                next_percent += 10
+                        elif downloaded_bytes >= next_unknown_report:
+                            _print_progress(progress_label, downloaded_bytes, None)
+                            next_unknown_report = downloaded_bytes + UNKNOWN_PROGRESS_REPORT_STEP_BYTES
+                    if progress_label:
+                        _print_progress(progress_label, downloaded_bytes, total_bytes, final=True)
                     return temp_path, response_headers
             except urllib.error.HTTPError as exc:
                 temp_path.unlink(missing_ok=True)
@@ -203,7 +260,12 @@ class SyncClient:
             except urllib.error.URLError as exc:
                 temp_path.unlink(missing_ok=True)
                 raise SyncApiError(f"{method} {path} failed: {exc}") from exc
-            except Exception:
+            except (TimeoutError, socket.timeout) as exc:
+                temp_path.unlink(missing_ok=True)
+                raise SyncApiError(
+                    f"{method} {path} timed out after {effective_timeout}s"
+                ) from exc
+            except BaseException:
                 temp_path.unlink(missing_ok=True)
                 raise
 
@@ -237,6 +299,12 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=DEFAULT_TIMEOUT_SECONDS,
         help="HTTP timeout for each request",
+    )
+    parser.add_argument(
+        "--archive-timeout-seconds",
+        type=int,
+        default=DEFAULT_ARCHIVE_TIMEOUT_SECONDS,
+        help="Timeout for waiting on the server to prepare and start streaming a sync archive",
     )
     parser.add_argument(
         "--state-dir",
@@ -283,6 +351,18 @@ def _parse_args() -> argparse.Namespace:
         "--force",
         action="store_true",
         help="Sync matching remote files even if they are already confirmed locally",
+    )
+    sync_parser.add_argument(
+        "--batch-max-bytes",
+        type=int,
+        default=DEFAULT_BATCH_MAX_BYTES,
+        help="Maximum total payload size per archive request; use 0 to disable byte-based batching",
+    )
+    sync_parser.add_argument(
+        "--batch-max-files",
+        type=int,
+        default=DEFAULT_BATCH_MAX_FILES,
+        help="Maximum number of files per archive request; use 0 to disable file-count batching",
     )
 
     delete_parser = subparsers.add_parser("delete", help="Delete remote files that were already synced")
@@ -338,6 +418,53 @@ def _save_json(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
 
 
+def _safe_int(value: object) -> int | None:
+    if value in (None, ""):
+        return None
+    try:
+        return int(str(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _format_bytes(value: int) -> str:
+    units = ["B", "KiB", "MiB", "GiB", "TiB"]
+    size = float(value)
+    unit = units[0]
+    for candidate in units:
+        unit = candidate
+        if size < 1024 or candidate == units[-1]:
+            break
+        size /= 1024
+    if unit == "B":
+        return f"{int(size)} {unit}"
+    return f"{size:.1f} {unit}"
+
+
+def _print_status(message: str) -> None:
+    print(message, flush=True)
+
+
+def _print_progress(
+    label: str,
+    current_bytes: int,
+    total_bytes: int | None,
+    *,
+    final: bool = False,
+) -> None:
+    if total_bytes is not None and total_bytes > 0:
+        percent = min(current_bytes / total_bytes * 100, 100.0)
+        suffix = "completed" if final else "in progress"
+        print(
+            f"{label}: {percent:.1f}% "
+            f"({_format_bytes(current_bytes)} / {_format_bytes(total_bytes)}) [{suffix}]",
+            flush=True,
+        )
+        return
+    suffix = "completed" if final else "in progress"
+    print(f"{label}: {_format_bytes(current_bytes)} [{suffix}]", flush=True)
+
+
 def _file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -356,6 +483,9 @@ def _extract_archive(archive_path: Path, output_dir: Path) -> tuple[Path, list[s
     try:
         with tarfile.open(archive_path, mode="r:gz") as archive:
             members = archive.getmembers()
+            file_members = [member for member in members if member.isfile()]
+            total_files = len(file_members)
+            report_every = max(1, total_files // 10) if total_files > 10 else 1
             staging_root = staging_dir.resolve()
             for member in members:
                 member_path = staging_dir / member.name
@@ -381,7 +511,10 @@ def _extract_archive(archive_path: Path, output_dir: Path) -> tuple[Path, list[s
                 with source, target_path.open("wb") as handle:
                     shutil.copyfileobj(source, handle)
                 extracted.append(member.name)
-    except Exception:
+                extracted_count = len(extracted)
+                if extracted_count % report_every == 0 or extracted_count == total_files:
+                    _print_status(f"extracting archive: {extracted_count}/{total_files} files")
+    except BaseException:
         shutil.rmtree(staging_dir, ignore_errors=True)
         raise
     return staging_dir, extracted
@@ -529,6 +662,51 @@ def _filter_confirmed_paths(
     return filtered
 
 
+def _entry_size_bytes(path: str, manifest_entries: dict[str, dict[str, Any]]) -> int:
+    entry = manifest_entries.get(path)
+    if entry is None:
+        raise SyncApiError(f"manifest is missing entry metadata for path: {path}")
+    return int(entry.get("size_bytes") or 0)
+
+
+def _build_sync_batches(
+    archive_paths: list[str],
+    manifest_entries: dict[str, dict[str, Any]],
+    *,
+    max_batch_bytes: int,
+    max_batch_files: int,
+) -> list[list[str]]:
+    if not archive_paths:
+        return []
+    if max_batch_bytes <= 0 and max_batch_files <= 0:
+        return [archive_paths]
+
+    batches: list[list[str]] = []
+    current_batch: list[str] = []
+    current_batch_bytes = 0
+    for path in archive_paths:
+        path_size = _entry_size_bytes(path, manifest_entries)
+        exceeds_file_limit = max_batch_files > 0 and current_batch and len(current_batch) >= max_batch_files
+        exceeds_byte_limit = (
+            max_batch_bytes > 0
+            and current_batch
+            and current_batch_bytes + path_size > max_batch_bytes
+        )
+        if exceeds_file_limit or exceeds_byte_limit:
+            batches.append(current_batch)
+            current_batch = []
+            current_batch_bytes = 0
+        current_batch.append(path)
+        current_batch_bytes += path_size
+    if current_batch:
+        batches.append(current_batch)
+    return batches
+
+
+def _batch_total_bytes(batch_paths: list[str], manifest_entries: dict[str, dict[str, Any]]) -> int:
+    return sum(_entry_size_bytes(path, manifest_entries) for path in batch_paths)
+
+
 def _build_verified_entries(
     archive_paths: list[str],
     extracted: list[str],
@@ -625,7 +803,7 @@ def _write_sync_receipt(
         receipt_path = Path(explicit_path).expanduser().resolve()
     else:
         receipts_dir = state_dir / "receipts"
-        receipt_name = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + ".json"
+        receipt_name = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ") + ".json"
         receipt_path = receipts_dir / receipt_name
     _save_json(receipt_path, receipt_payload)
     return receipt_path
@@ -655,7 +833,91 @@ def _print_json(payload: dict[str, Any]) -> None:
     print(json.dumps(payload, indent=2, ensure_ascii=True))
 
 
+def _batch_receipt_out(explicit_path: str, batch_index: int, batch_count: int) -> str:
+    if not explicit_path.strip() or batch_count <= 1:
+        return explicit_path
+    resolved = Path(explicit_path).expanduser().resolve()
+    suffix = "".join(resolved.suffixes)
+    stem = resolved.name[: -len(suffix)] if suffix else resolved.name
+    batch_name = f"{stem}.part{batch_index:03d}of{batch_count:03d}{suffix}"
+    return str(resolved.with_name(batch_name))
+
+
+def _sync_batch(
+    client: SyncClient,
+    *,
+    batch_paths: list[str],
+    manifest_entries: dict[str, dict[str, Any]],
+    output_dir: Path,
+    state_dir: Path,
+    sync_index: dict[str, dict[str, Any]],
+    receipt_out: str,
+    delete_remote: bool,
+    batch_index: int,
+    batch_count: int,
+) -> tuple[int, int]:
+    batch_label = f"batch {batch_index}/{batch_count}"
+    batch_bytes = _batch_total_bytes(batch_paths, manifest_entries)
+    _print_status(f"{batch_label}: syncing {len(batch_paths)} files, {_format_bytes(batch_bytes)}")
+    _print_status(f"{batch_label}: requesting archive from server...")
+    archive_path, content_disposition = client.archive(batch_paths)
+    archive_size = archive_path.stat().st_size
+    try:
+        _print_status(f"{batch_label}: extracting archive to staging directory...")
+        staging_dir, extracted = _extract_archive(archive_path, output_dir)
+        try:
+            _print_status(f"{batch_label}: verifying extracted files...")
+            verified_entries = _build_verified_entries(
+                batch_paths,
+                extracted,
+                manifest_entries,
+                staging_dir,
+            )
+            _print_status(f"{batch_label}: committing verified files to output directory...")
+            _commit_verified_entries(staging_dir, output_dir, verified_entries)
+        finally:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+    finally:
+        archive_path.unlink(missing_ok=True)
+
+    receipt_payload = {
+        "verified_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "base_url": client._base_url,
+        "output_dir": str(output_dir),
+        "state_dir": str(state_dir),
+        "entries": verified_entries,
+        "batch_index": batch_index,
+        "batch_count": batch_count,
+    }
+    receipt_path = _write_sync_receipt(
+        state_dir,
+        receipt_payload,
+        _batch_receipt_out(receipt_out, batch_index, batch_count),
+    )
+    _update_sync_index(state_dir, sync_index, verified_entries, receipt_path)
+    _print_status(f"{batch_label}: archive downloaded: {archive_size} bytes")
+    _print_status(f"{batch_label}: files extracted: {len(verified_entries)}")
+    _print_status(f"{batch_label}: output dir: {output_dir}")
+    _print_status(f"{batch_label}: receipt saved to {receipt_path}")
+    if content_disposition:
+        _print_status(f"{batch_label}: content disposition: {content_disposition}")
+    if delete_remote:
+        _print_status(f"{batch_label}: submitting remote delete ack...")
+        result = client.ack(
+            verified_entries,
+            source="sync --delete-remote",
+            client_receipt_path=str(receipt_path),
+        )
+        _print_status(
+            f"{batch_label}: remote delete scheduled: "
+            f"{result.get('acked_file_count', 0)} files, "
+            f"delete_after={result.get('delete_after_max')}"
+        )
+    return len(verified_entries), archive_size
+
+
 def _run_manifest(client: SyncClient, args: argparse.Namespace) -> int:
+    _print_status("requesting remote manifest...")
     manifest = client.manifest()
     if args.output:
         output_path = Path(args.output).expanduser().resolve()
@@ -665,12 +927,23 @@ def _run_manifest(client: SyncClient, args: argparse.Namespace) -> int:
     return 0
 
 
+def _cleanup_stale_staging_dirs(output_dir: Path) -> None:
+    """Remove leftover poly15-sync-* staging directories from interrupted syncs."""
+    for stale in output_dir.glob("poly15-sync-*"):
+        if stale.is_dir():
+            shutil.rmtree(stale, ignore_errors=True)
+
+
 def _run_sync(client: SyncClient, args: argparse.Namespace) -> int:
     requested_paths = [path for path in args.paths if path]
+    _print_status("requesting remote manifest...")
     manifest = client.manifest()
     manifest_entries = _manifest_entries_by_path(manifest)
     output_dir = _resolve_output_dir(args)
     state_dir = _resolve_state_dir(args, output_dir)
+
+    _cleanup_stale_staging_dirs(output_dir)
+
     sync_index = _load_sync_index(state_dir)
 
     archive_paths = _expand_requested_paths(manifest, requested_paths)
@@ -681,64 +954,80 @@ def _run_sync(client: SyncClient, args: argparse.Namespace) -> int:
             sync_index,
             output_dir,
         )
+
+    # Sort oldest-first by file mtime so historical data is prioritised and
+    # GC can reclaim server disk space as early as possible.
+    archive_paths = sorted(
+        archive_paths,
+        key=lambda p: manifest_entries[p].get("mtime_ns", 0),
+    )
+
     if args.manifest_out:
         manifest_path = Path(args.manifest_out).expanduser().resolve()
         _save_json(manifest_path, manifest)
-        print(f"manifest saved to {manifest_path}")
+        _print_status(f"manifest saved to {manifest_path}")
 
     if not archive_paths:
-        print("no unsynced remote files matched; skip sync")
+        _print_status("no unsynced remote files matched; skip sync")
         return 0
 
-    archive_path, content_disposition = client.archive(archive_paths)
-    archive_size = archive_path.stat().st_size
-    try:
-        staging_dir, extracted = _extract_archive(archive_path, output_dir)
-        try:
-            verified_entries = _build_verified_entries(
-                archive_paths,
-                extracted,
-                manifest_entries,
-                staging_dir,
-            )
-            _commit_verified_entries(staging_dir, output_dir, verified_entries)
-        finally:
-            shutil.rmtree(staging_dir, ignore_errors=True)
-    finally:
-        archive_path.unlink(missing_ok=True)
-    receipt_payload = {
-        "verified_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-        "base_url": client._base_url,
-        "output_dir": str(output_dir),
-        "state_dir": str(state_dir),
-        "manifest_generated_at": manifest.get("generated_at"),
-        "sync_root": manifest.get("sync_root"),
-        "entries": verified_entries,
-    }
-    receipt_path = _write_sync_receipt(
-        state_dir,
-        receipt_payload,
-        args.receipt_out,
+    total_bytes = _batch_total_bytes(
+        archive_paths,
+        manifest_entries,
     )
-    _update_sync_index(state_dir, sync_index, verified_entries, receipt_path)
-    print(f"archive downloaded: {archive_size} bytes")
-    print(f"files extracted: {len(verified_entries)}")
-    print(f"output dir: {output_dir}")
-    print(f"receipt saved to {receipt_path}")
-    if content_disposition:
-        print(f"content disposition: {content_disposition}")
-
-    if args.delete_remote:
-        result = client.ack(
-            verified_entries,
-            source="sync --delete-remote",
-            client_receipt_path=str(receipt_path),
-        )
-        print(
-            "remote delete scheduled: "
-            f"{result.get('acked_file_count', 0)} files, "
-            f"delete_after={result.get('delete_after_max')}"
-        )
+    sync_batches = _build_sync_batches(
+        archive_paths,
+        manifest_entries,
+        max_batch_bytes=args.batch_max_bytes,
+        max_batch_files=args.batch_max_files,
+    )
+    _print_status(
+        "remote manifest received: "
+        f"{len(archive_paths)} files selected for sync"
+    )
+    _print_status(
+        "sync plan: "
+        f"{len(archive_paths)} files, {_format_bytes(total_bytes)}, "
+        f"{len(sync_batches)} batch(es)"
+    )
+    total_verified = 0
+    total_archive_bytes = 0
+    for batch_index, batch_paths in enumerate(sync_batches, start=1):
+        batch_label = f"batch {batch_index}/{len(sync_batches)}"
+        last_error: SyncApiError | None = None
+        for attempt in range(1, 4):
+            try:
+                verified_count, archive_size = _sync_batch(
+                    client,
+                    batch_paths=batch_paths,
+                    manifest_entries=manifest_entries,
+                    output_dir=output_dir,
+                    state_dir=state_dir,
+                    sync_index=sync_index,
+                    receipt_out=args.receipt_out,
+                    delete_remote=args.delete_remote,
+                    batch_index=batch_index,
+                    batch_count=len(sync_batches),
+                )
+                total_verified += verified_count
+                total_archive_bytes += archive_size
+                last_error = None
+                break
+            except SyncApiError as exc:
+                last_error = exc
+                if attempt < 3:
+                    wait_s = 2 ** attempt
+                    _print_status(
+                        f"{batch_label}: attempt {attempt} failed ({exc}); "
+                        f"retrying in {wait_s}s"
+                    )
+                    time.sleep(wait_s)
+        if last_error is not None:
+            raise last_error
+    _print_status(
+        f"sync complete: {total_verified} files across {len(sync_batches)} batch(es), "
+        f"{_format_bytes(total_archive_bytes)} downloaded"
+    )
     return 0
 
 
@@ -746,6 +1035,7 @@ def _run_delete(client: SyncClient, args: argparse.Namespace) -> int:
     requested_paths = [path for path in args.paths if path]
     if not requested_paths and not args.all:
         raise SyncApiError("delete requires explicit paths or --all")
+    _print_status("requesting remote manifest...")
     manifest = client.manifest()
     output_dir = _resolve_output_dir(args)
     state_dir = _resolve_state_dir(args, output_dir)
@@ -782,6 +1072,7 @@ def main() -> int:
         base_url=_resolve_base_url(args),
         token=_resolve_token(args),
         timeout_seconds=args.timeout_seconds,
+        archive_timeout_seconds=args.archive_timeout_seconds,
     )
     if args.command == "manifest":
         return _run_manifest(client, args)
@@ -800,3 +1091,6 @@ if __name__ == "__main__":
     except SyncApiError as exc:
         print(f"error: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc
+    except KeyboardInterrupt:
+        print("sync interrupted by user", file=sys.stderr)
+        raise SystemExit(130)

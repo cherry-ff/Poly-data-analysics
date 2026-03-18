@@ -407,6 +407,11 @@ class DashboardHTTPServer(ThreadingHTTPServer):
         self._sync_gc_state_lock = threading.Lock()
         self._sync_gc_stop_event = threading.Event()
         self._sync_gc_thread: threading.Thread | None = None
+        # sha256 cache: relative_path -> (size_bytes, mtime_ns, hex_digest)
+        # Sealed files are immutable so entries never need invalidation,
+        # only removal when GC deletes the file.
+        self._sha256_cache: dict[str, tuple[int, int, str]] = {}
+        self._sha256_cache_lock = threading.Lock()
         self._cache_lock = threading.Lock()
         self._live_signature: tuple[int, int] | None = None
         self._cache_payload: dict | None = None
@@ -1188,7 +1193,7 @@ class DashboardHTTPServer(ThreadingHTTPServer):
             "segment_seq": segment_seq,
             "size_bytes": stat.st_size,
             "mtime_ns": stat.st_mtime_ns,
-            "sha256": self._file_sha256(path),
+            "sha256": self._file_sha256_cached(relative_path, path, stat.st_size, stat.st_mtime_ns),
         }
 
     @staticmethod
@@ -1228,6 +1233,25 @@ class DashboardHTTPServer(ThreadingHTTPServer):
     @staticmethod
     def _parse_utc_ts(value: str) -> datetime:
         return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc)
+
+    def _file_sha256_cached(
+        self, relative_path: str, path: Path, size_bytes: int, mtime_ns: int
+    ) -> str:
+        """Return sha256 for a sealed file, using an in-memory cache.
+
+        Sealed files are immutable after rotate, so (size_bytes, mtime_ns) is a
+        stable cache key.  The cache is never explicitly invalidated; entries just
+        become unreachable once GC removes the file and it stops appearing in the
+        manifest iteration.
+        """
+        with self._sha256_cache_lock:
+            cached = self._sha256_cache.get(relative_path)
+            if cached and cached[0] == size_bytes and cached[1] == mtime_ns:
+                return cached[2]
+        digest = self._file_sha256(path)
+        with self._sha256_cache_lock:
+            self._sha256_cache[relative_path] = (size_bytes, mtime_ns, digest)
+        return digest
 
     @staticmethod
     def _file_sha256(path: Path) -> str:
