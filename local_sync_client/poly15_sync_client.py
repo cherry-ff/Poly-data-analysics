@@ -28,6 +28,10 @@ DEFAULT_ARCHIVE_TIMEOUT_SECONDS = 1800
 DEFAULT_BATCH_MAX_BYTES = 64 * 1024 * 1024
 DEFAULT_BATCH_MAX_FILES = 64
 DOWNLOAD_CHUNK_SIZE = 1024 * 1024
+# Grace period after a market's end_ts_ms before we consider it fully settled
+# and safe to ACK (delete from server). Must be long enough for the recorder
+# to flush and seal any remaining live segments (rotate_interval is 5 min).
+DEFAULT_MARKET_SETTLE_GRACE_MS = 15 * 60 * 1000  # 15 minutes
 UNKNOWN_PROGRESS_REPORT_STEP_BYTES = 8 * 1024 * 1024
 
 
@@ -902,17 +906,28 @@ def _sync_batch(
     if content_disposition:
         _print_status(f"{batch_label}: content disposition: {content_disposition}")
     if delete_remote:
-        _print_status(f"{batch_label}: submitting remote delete ack...")
-        result = client.ack(
+        ack_entries, skipped_active = _filter_settled_for_ack(
             verified_entries,
-            source="sync --delete-remote",
-            client_receipt_path=str(receipt_path),
+            output_dir,
+            settle_grace_ms=DEFAULT_MARKET_SETTLE_GRACE_MS,
         )
-        _print_status(
-            f"{batch_label}: remote delete scheduled: "
-            f"{result.get('acked_file_count', 0)} files, "
-            f"delete_after={result.get('delete_after_max')}"
-        )
+        if skipped_active:
+            _print_status(
+                f"{batch_label}: skipped ACK for {skipped_active} file(s) "
+                f"from active/unfinished markets (will re-check on next sync)"
+            )
+        if ack_entries:
+            _print_status(f"{batch_label}: submitting remote delete ack for {len(ack_entries)} settled file(s)...")
+            result = client.ack(
+                ack_entries,
+                source="sync --delete-remote",
+                client_receipt_path=str(receipt_path),
+            )
+            _print_status(
+                f"{batch_label}: remote delete scheduled: "
+                f"{result.get('acked_file_count', 0)} files, "
+                f"delete_after={result.get('delete_after_max')}"
+            )
     return len(verified_entries), archive_size
 
 
@@ -925,6 +940,54 @@ def _run_manifest(client: SyncClient, args: argparse.Namespace) -> int:
         print(f"manifest saved to {output_path}")
     _print_json(manifest)
     return 0
+
+
+def _read_market_end_ts_ms(output_dir: Path, market_id: str) -> int | None:
+    """Return end_ts_ms from local market_metadata files, or None if not found."""
+    meta_dir = output_dir / "markets" / market_id / "market_metadata"
+    if not meta_dir.exists():
+        return None
+    files = sorted(meta_dir.glob("*.jsonl"))
+    for meta_file in reversed(files):
+        try:
+            lines = meta_file.read_text(encoding="utf-8").strip().splitlines()
+            for line in reversed(lines):
+                d = json.loads(line)
+                end_ts = d.get("payload", {}).get("market", {}).get("end_ts_ms")
+                if end_ts is not None:
+                    return int(end_ts)
+        except Exception:
+            continue
+    return None
+
+
+def _filter_settled_for_ack(
+    verified_entries: list[dict[str, Any]],
+    output_dir: Path,
+    settle_grace_ms: int,
+) -> tuple[list[dict[str, Any]], int]:
+    """Return (entries_to_ack, skipped_count).
+
+    Global (non-market) files are always ACKed – they are rolling streams with
+    no settlement concept.  Market files are only ACKed once the market's
+    end_ts_ms has passed (plus settle_grace_ms), so the server keeps unfinished
+    markets available for future incremental syncs.
+    """
+    now_ms = int(time.time() * 1000)
+    to_ack: list[dict[str, Any]] = []
+    skipped = 0
+    for entry in verified_entries:
+        market_id = entry.get("market_id")
+        if not market_id:
+            # global stream – always safe to ACK
+            to_ack.append(entry)
+            continue
+        end_ts_ms = _read_market_end_ts_ms(output_dir, str(market_id))
+        if end_ts_ms is None or now_ms >= end_ts_ms + settle_grace_ms:
+            to_ack.append(entry)
+        else:
+            skipped += 1
+    return to_ack, skipped
 
 
 def _cleanup_stale_staging_dirs(output_dir: Path) -> None:

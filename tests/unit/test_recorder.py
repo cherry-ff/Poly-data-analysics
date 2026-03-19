@@ -4,7 +4,7 @@ import asyncio
 import tempfile
 from pathlib import Path
 
-from storage.recorder import AsyncRecorder
+from storage.recorder import AsyncRecorder, flush_live_records_to_sealed
 
 
 async def _wait_for(predicate, *, timeout_s: float = 1.5) -> None:
@@ -111,3 +111,34 @@ async def _run_recorder_rotates_live_files_into_sealed_segments() -> None:
 
 def test_recorder_rotates_live_files_into_sealed_segments() -> None:
     asyncio.run(_run_recorder_rotates_live_files_into_sealed_segments())
+
+
+def test_flush_live_records_to_sealed_rotates_existing_disk_files() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        output_dir = Path(tmpdir)
+        live_global = output_dir / "global" / "feeds_binance_tick.jsonl"
+        live_market = output_dir / "markets" / "1604309" / "pricing_theo.jsonl"
+        existing_sealed = (
+            output_dir / "sealed" / "global" / "feeds_binance_tick" / "00000000000000000001.jsonl"
+        )
+        existing_sealed.parent.mkdir(parents=True, exist_ok=True)
+        existing_sealed.write_text('{"existing": true}\n', encoding="utf-8")
+        live_global.parent.mkdir(parents=True, exist_ok=True)
+        live_market.parent.mkdir(parents=True, exist_ok=True)
+        live_global.write_text('{"payload":{"tick":{"recv_ts_ms":1000}}}\n', encoding="utf-8")
+        live_market.write_text('{"payload":{"snapshot":{"market_id":"1604309"}}}\n', encoding="utf-8")
+
+        result = flush_live_records_to_sealed(output_dir)
+
+        sealed_global = (
+            output_dir / "sealed" / "global" / "feeds_binance_tick" / "00000000000000000002.jsonl"
+        )
+        sealed_market = (
+            output_dir / "sealed" / "markets" / "1604309" / "pricing_theo" / "00000000000000000001.jsonl"
+        )
+        assert result["rotated_file_count"] == 2
+        assert result["deleted_empty_live_file_count"] == 0
+        assert not live_global.exists()
+        assert not live_market.exists()
+        assert sealed_global.exists()
+        assert sealed_market.exists()

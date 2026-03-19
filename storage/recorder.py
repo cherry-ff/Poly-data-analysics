@@ -31,6 +31,95 @@ class _PolyEncoder(json.JSONEncoder):
 _STOP = object()
 
 
+def _segment_dir_for_relative_path(
+    base_dir: pathlib.Path,
+    relative_path: str,
+) -> pathlib.Path:
+    relative = pathlib.Path(relative_path)
+    topic_stem = relative.stem
+    parts = relative.parts
+    if len(parts) >= 3 and parts[0] == "markets":
+        return base_dir / "sealed" / "markets" / parts[1] / topic_stem
+    if len(parts) >= 2 and parts[0] == "global":
+        return base_dir / "sealed" / "global" / topic_stem
+    return base_dir / "sealed" / "other" / topic_stem
+
+
+def _discover_last_segment_index(segment_dir: pathlib.Path) -> int:
+    if not segment_dir.exists():
+        return 0
+    highest = 0
+    for path in segment_dir.glob("*.jsonl"):
+        try:
+            highest = max(highest, int(path.stem))
+        except ValueError:
+            continue
+    return highest
+
+
+def _next_segment_path_for_relative_path(
+    base_dir: pathlib.Path,
+    relative_path: str,
+    segment_counters: dict[str, int],
+) -> pathlib.Path:
+    segment_dir = _segment_dir_for_relative_path(base_dir, relative_path)
+    segment_key = segment_dir.relative_to(base_dir).as_posix()
+    last_index = segment_counters.get(segment_key)
+    if last_index is None:
+        last_index = _discover_last_segment_index(segment_dir)
+    next_index = last_index + 1
+    segment_counters[segment_key] = next_index
+    return segment_dir / f"{next_index:020d}.jsonl"
+
+
+def flush_live_records_to_sealed(output_dir: str | pathlib.Path) -> dict[str, int]:
+    """Rotate every on-disk live JSONL file into the sealed layout.
+
+    This is intended for maintenance/backfill flows while the collector is stopped.
+    It scans the live `global/*.jsonl` and `markets/*/*.jsonl` files on disk,
+    moves non-empty files into the next sealed segment path, and removes empty
+    live files.
+    """
+
+    base_dir = pathlib.Path(output_dir).resolve()
+    segment_counters: dict[str, int] = {}
+    rotated_file_count = 0
+    rotated_bytes = 0
+    deleted_empty_live_file_count = 0
+
+    live_paths = sorted((base_dir / "global").glob("*.jsonl"))
+    live_paths.extend(sorted((base_dir / "markets").glob("*/*.jsonl")))
+
+    for path in live_paths:
+        if not path.is_file():
+            continue
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        if stat.st_size <= 0:
+            path.unlink(missing_ok=True)
+            deleted_empty_live_file_count += 1
+            continue
+
+        relative_path = path.relative_to(base_dir).as_posix()
+        segment_path = _next_segment_path_for_relative_path(
+            base_dir,
+            relative_path,
+            segment_counters,
+        )
+        segment_path.parent.mkdir(parents=True, exist_ok=True)
+        path.rename(segment_path)
+        rotated_file_count += 1
+        rotated_bytes += stat.st_size
+
+    return {
+        "rotated_file_count": rotated_file_count,
+        "rotated_bytes": rotated_bytes,
+        "deleted_empty_live_file_count": deleted_empty_live_file_count,
+    }
+
+
 @dataclasses.dataclass(slots=True)
 class _StreamState:
     opened_at_monotonic: float
@@ -310,32 +399,12 @@ class AsyncRecorder:
         path.rename(segment_path)
 
     def _next_segment_path(self, relative_path: str) -> pathlib.Path:
-        relative = pathlib.Path(relative_path)
-        topic_stem = relative.stem
-        parts = relative.parts
-        if len(parts) >= 3 and parts[0] == "markets":
-            segment_dir = self._dir / "sealed" / "markets" / parts[1] / topic_stem
-        elif len(parts) >= 2 and parts[0] == "global":
-            segment_dir = self._dir / "sealed" / "global" / topic_stem
-        else:
-            segment_dir = self._dir / "sealed" / "other" / topic_stem
-
-        segment_key = segment_dir.relative_to(self._dir).as_posix()
-        last_index = self._segment_counters.get(segment_key)
-        if last_index is None:
-            last_index = self._discover_last_segment_index(segment_dir)
-        next_index = last_index + 1
-        self._segment_counters[segment_key] = next_index
-        return segment_dir / f"{next_index:020d}.jsonl"
+        return _next_segment_path_for_relative_path(
+            self._dir,
+            relative_path,
+            self._segment_counters,
+        )
 
     @staticmethod
     def _discover_last_segment_index(segment_dir: pathlib.Path) -> int:
-        if not segment_dir.exists():
-            return 0
-        highest = 0
-        for path in segment_dir.glob("*.jsonl"):
-            try:
-                highest = max(highest, int(path.stem))
-            except ValueError:
-                continue
-        return highest
+        return _discover_last_segment_index(segment_dir)
