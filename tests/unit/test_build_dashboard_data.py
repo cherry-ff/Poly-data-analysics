@@ -362,7 +362,7 @@ def test_build_dashboard_payload_merges_sealed_and_live_streams(tmp_path: Path) 
 
     payload = build_dashboard_data.build_dashboard_payload(records_root)
 
-    assert payload["global"]["binance"]["count"] == 2
+    assert payload["global"]["binance"]["count"] is None
     assert payload["global"]["binance"]["latest"]["ts"] == start_ts + 2_000
     assert payload["market_order"] == [market_id]
     assert len(payload["markets"][market_id]["series"]["quote"]) == 2

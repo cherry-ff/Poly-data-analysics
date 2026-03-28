@@ -7,6 +7,8 @@ const COLORS = {
 
 const REFRESH_INTERVAL_MS = 5000;
 
+const PAGE_SIZE = 50;
+
 const state = {
   indexPayload: null,
   marketDetails: {},
@@ -21,13 +23,20 @@ const state = {
   hoverTsByGroup: {},
   refreshTimerId: null,
   refreshInFlight: false,
+  // Pagination
+  allMarketOrder: [],
+  allMarkets: {},
+  totalMarkets: 0,
+  hasMore: false,
+  loadingMore: false,
 };
 
 
 async function bootstrap() {
   try {
-    state.indexPayload = await fetchJson("./data/dashboard-index.json");
-    state.selectedMarketId = state.indexPayload.market_order[0] || null;
+    const payload = await fetchJson(`./data/dashboard-index.json?offset=0&limit=${PAGE_SIZE}`);
+    mergeIndexPayload(payload);
+    state.selectedMarketId = state.allMarketOrder[0] || null;
     bindControls();
     renderApp();
     await ensureMarketDetail(state.selectedMarketId);
@@ -43,6 +52,40 @@ async function bootstrap() {
         </div>
       </main>
     `;
+  }
+}
+
+
+function mergeIndexPayload(payload) {
+  state.indexPayload = payload;
+  const existingSet = new Set(state.allMarketOrder);
+  for (const id of payload.market_order) {
+    if (!existingSet.has(id)) {
+      state.allMarketOrder.push(id);
+      existingSet.add(id);
+    }
+    state.allMarkets[id] = payload.markets[id];
+  }
+  state.totalMarkets = payload.total ?? state.allMarketOrder.length;
+  state.hasMore = payload.has_more ?? false;
+}
+
+
+async function loadMoreMarkets() {
+  if (state.loadingMore || !state.hasMore) {
+    return;
+  }
+  state.loadingMore = true;
+  renderMarketList();
+  try {
+    const offset = state.allMarketOrder.length;
+    const payload = await fetchJson(`./data/dashboard-index.json?offset=${offset}&limit=${PAGE_SIZE}`);
+    mergeIndexPayload(payload);
+  } catch (error) {
+    console.error("加载更多市场失败", error);
+  } finally {
+    state.loadingMore = false;
+    renderMarketList();
   }
 }
 
@@ -129,11 +172,17 @@ async function refreshDashboard() {
   }
   state.refreshInFlight = true;
   try {
-    const latestIndex = await fetchJson("./data/dashboard-index.json");
+    const latestIndex = await fetchJson(`./data/dashboard-index.json?offset=0&limit=${PAGE_SIZE}`);
+    // Update first-page markets in place, preserve rest of loaded pages
+    for (const [id, market] of Object.entries(latestIndex.markets)) {
+      state.allMarkets[id] = market;
+    }
     state.indexPayload = latestIndex;
+    state.totalMarkets = latestIndex.total ?? state.totalMarkets;
+    state.hasMore = latestIndex.has_more ?? state.hasMore;
 
-    if (!latestIndex.market_order.includes(state.selectedMarketId)) {
-      state.selectedMarketId = latestIndex.market_order[0] || null;
+    if (!state.allMarketOrder.includes(state.selectedMarketId)) {
+      state.selectedMarketId = state.allMarketOrder[0] || null;
     }
 
     const marketId = state.selectedMarketId;
@@ -191,9 +240,8 @@ function renderMeta() {
 
 
 function renderMarketList() {
-  const payload = state.indexPayload;
   const container = document.getElementById("market-list");
-  const marketIds = payload.market_order.filter((marketId) => marketId.includes(state.searchTerm));
+  const marketIds = state.allMarketOrder.filter((marketId) => marketId.includes(state.searchTerm));
 
   if (!marketIds.length) {
     container.innerHTML = `<div class="empty-state">没有匹配的市场</div>`;
@@ -204,8 +252,8 @@ function renderMarketList() {
     state.selectedMarketId = marketIds[0];
   }
 
-  container.innerHTML = marketIds.map((marketId) => {
-    const market = payload.markets[marketId];
+  const buttons = marketIds.map((marketId) => {
+    const market = state.allMarkets[marketId];
     const phase = market.summary.latest_phase || market.metadata?.status || "unknown";
     const progress = formatMetric(market.summary.progress_pct, "percent");
     const latestQuote = formatMetric(market.summary.latest_quote_bid_sum, "probability");
@@ -218,6 +266,12 @@ function renderMarketList() {
     `;
   }).join("");
 
+  const sentinelHtml = state.hasMore && !state.searchTerm
+    ? `<div id="scroll-sentinel" style="height:1px"></div>`
+    : "";
+
+  container.innerHTML = buttons + sentinelHtml;
+
   container.querySelectorAll("[data-market-id]").forEach((button) => {
     button.addEventListener("click", async () => {
       state.selectedMarketId = button.dataset.marketId;
@@ -226,6 +280,17 @@ function renderMarketList() {
       window.scrollTo({ top: 0, behavior: "smooth" });
     });
   });
+
+  const sentinel = document.getElementById("scroll-sentinel");
+  if (sentinel) {
+    const observer = new IntersectionObserver((entries) => {
+      if (entries[0].isIntersecting) {
+        observer.disconnect();
+        void loadMoreMarkets();
+      }
+    }, { root: container, threshold: 0 });
+    observer.observe(sentinel);
+  }
 }
 
 
@@ -233,7 +298,7 @@ function renderGlobalStats() {
   const payload = state.indexPayload;
   const global = payload.global;
   const cards = [
-    statCard("市场数量", String(payload.market_order.length), "已解析的 numeric market"),
+    statCard("市场数量", String(state.totalMarkets || state.allMarketOrder.length), "已解析的 numeric market"),
     statCard("Binance 最新中间价", formatMetric(global.binance.latest?.mid, "price"), `${global.binance.count} records`),
     statCard("Chainlink 最新价格", formatMetric(global.chainlink.latest?.price, "price"), `${global.chainlink.count} records`),
     statCard("最新 Basis", formatMetric(global.basis.latest?.basis, "basis"), `${global.basis.count} aligned points`),
@@ -630,7 +695,7 @@ function clipPointsToDomain(points, minX, maxX) {
 
 
 function getSelectedMarketSummary() {
-  return state.indexPayload?.markets?.[state.selectedMarketId] || null;
+  return state.allMarkets[state.selectedMarketId] || null;
 }
 
 

@@ -4,6 +4,7 @@ import importlib.util
 import io
 import json
 import tarfile
+import threading
 from pathlib import Path
 
 
@@ -61,6 +62,55 @@ def test_find_record_offset_for_ts_returns_start_for_early_target(tmp_path: Path
         )
 
     assert offset == 0
+
+
+def test_select_stream_paths_for_window_skips_non_overlapping_segments(tmp_path: Path) -> None:
+    stream_a = tmp_path / "0001.jsonl"
+    stream_b = tmp_path / "0002.jsonl"
+    stream_c = tmp_path / "0003.jsonl"
+    _write_jsonl(stream_a, [{"payload": {"tick": {"recv_ts_ms": 1_000}}}])
+    _write_jsonl(stream_b, [{"payload": {"tick": {"recv_ts_ms": 2_000}}}])
+    _write_jsonl(stream_c, [{"payload": {"tick": {"recv_ts_ms": 3_000}}}])
+
+    server = object.__new__(dashboard_server.DashboardHTTPServer)
+    server._cache_lock = threading.Lock()
+    server._stream_file_ranges = {}
+
+    selected = server._select_stream_paths_for_window(
+        cache_key="feeds.binance.tick",
+        paths=[stream_a, stream_b, stream_c],
+        start_ts=1_500,
+        end_ts=2_500,
+        ts_getter=lambda record: record.get("payload", {}).get("tick", {}).get("recv_ts_ms"),
+    )
+
+    assert selected == [stream_b]
+
+
+def test_global_window_body_returns_empty_series_for_invalid_window() -> None:
+    server = object.__new__(dashboard_server.DashboardHTTPServer)
+    server._cache_lock = threading.Lock()
+    server._global_window_bodies = {}
+    server._records_signature = lambda: (0, 0)
+    server._ensure_live_caches_current = lambda current_signature: None
+    server._get_live_market_payload = lambda market_id: {
+        "window": {
+            "start_ts": None,
+            "end_ts": None,
+            "has_valid_bounds": False,
+        }
+    }
+    server._load_builder_and_files = lambda current_signature=None: (_ for _ in ()).throw(
+        AssertionError("invalid windows should not load global streams")
+    )
+
+    body = dashboard_server.DashboardHTTPServer.global_window_body(server, "1604309")
+    payload = json.loads(body.decode("utf-8"))
+
+    assert payload["market_id"] == "1604309"
+    assert payload["global"]["binance"] == {"count": 0, "latest": None, "series": []}
+    assert payload["global"]["chainlink"] == {"count": 0, "latest": None, "series": []}
+    assert payload["global"]["basis"] == {"count": 0, "latest": None, "series": []}
 
 
 def test_load_or_create_sync_token_persists_generated_token(tmp_path: Path) -> None:

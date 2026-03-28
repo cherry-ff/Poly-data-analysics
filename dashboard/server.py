@@ -10,6 +10,7 @@ import shutil
 import tarfile
 import tempfile
 import threading
+import time
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
@@ -81,7 +82,13 @@ class DashboardRequestHandler(SimpleHTTPRequestHandler):
             self._serve_sync_manifest()
             return
         if parsed.path == "/data/dashboard-index.json":
-            self._serve_index_json()
+            params = parse_qs(parsed.query)
+            try:
+                offset = max(0, int(params.get("offset", ["0"])[0]))
+                limit = max(1, min(200, int(params.get("limit", ["50"])[0])))
+            except (ValueError, IndexError):
+                offset, limit = 0, 50
+            self._serve_index_json(offset, limit)
             return
         if parsed.path == "/data/global-window.json":
             params = parse_qs(parsed.query)
@@ -139,9 +146,9 @@ class DashboardRequestHandler(SimpleHTTPRequestHandler):
             return
         self._serve_json_bytes(body)
 
-    def _serve_index_json(self) -> None:
+    def _serve_index_json(self, offset: int = 0, limit: int = 50) -> None:
         try:
-            body = self.server.dashboard_index_body()
+            body = self.server.dashboard_index_body(offset=offset, limit=limit)
         except Exception as exc:
             self._serve_error(exc)
             return
@@ -417,12 +424,21 @@ class DashboardHTTPServer(ThreadingHTTPServer):
         self._cache_payload: dict | None = None
         self._cache_body: bytes | None = None
         self._index_body: bytes | None = None
+        self._stale_index_body: bytes | None = None
+        self._index_building = False
         self._market_payloads: dict[str, dict] = {}
         self._market_bodies: dict[str, bytes] = {}
         self._global_window_bodies: dict[str, bytes] = {}
+        self._live_global_files: dict[str, list[Path]] | None = None
+        self._live_market_files: dict[str, dict[str, list[Path]]] | None = None
+        self._stream_file_ranges: dict[str, tuple[tuple[str, ...], list[tuple[Path, int | None, int | None]]]] = {}
         self._cache_signature: tuple[int, int] | None = None
         self._build_error: str | None = None
         self._building = False
+        # Signature TTL cache: avoids rglob on every request
+        self._sig_cache_val: tuple[int, int] | None = None
+        self._sig_cache_ts: float = 0.0
+        self._sig_cache_ttl: float = 2.0
         self._load_snapshot()
         self.warm_cache()
         self._start_sync_gc_thread()
@@ -458,18 +474,46 @@ class DashboardHTTPServer(ThreadingHTTPServer):
                 return self._cache_body
             raise RuntimeError(self._build_error or "dashboard cache unavailable")
 
-    def dashboard_index_body(self) -> bytes:
+    def dashboard_index_body(self, offset: int = 0, limit: int = 50) -> bytes:
         current_signature = self._records_signature()
         with self._cache_lock:
             self._ensure_live_caches_current(current_signature)
-            if self._index_body is not None:
-                return self._index_body
+            if offset == 0:
+                if self._index_body is not None:
+                    return self._index_body
+                stale = self._stale_index_body
+                if stale is not None and not self._index_building:
+                    self._index_building = True
+                    threading.Thread(
+                        target=self._rebuild_index_body,
+                        daemon=True,
+                        name="dashboard-index-builder",
+                    ).start()
+                    return stale
+                if stale is not None:
+                    return stale
 
-        index_payload = self._build_live_index_payload()
+        index_payload = self._build_live_index_payload(offset=offset, limit=limit)
         index_body = json.dumps(index_payload, indent=2).encode("utf-8")
+        if offset == 0:
+            with self._cache_lock:
+                self._index_body = index_body
+                self._stale_index_body = index_body
+                self._index_building = False
+        return index_body
+
+    def _rebuild_index_body(self) -> None:
+        try:
+            index_payload = self._build_live_index_payload()
+            index_body = json.dumps(index_payload, indent=2).encode("utf-8")
+        except Exception:
+            return
+        finally:
+            with self._cache_lock:
+                self._index_building = False
         with self._cache_lock:
             self._index_body = index_body
-        return index_body
+            self._stale_index_body = index_body
 
     def market_body(self, market_id: str) -> bytes:
         current_signature = self._records_signature()
@@ -499,25 +543,46 @@ class DashboardHTTPServer(ThreadingHTTPServer):
         window = market.get("window", {})
         start_ts = window.get("start_ts")
         end_ts = window.get("end_ts")
-        builder, global_files, _ = self._load_builder_and_files()
-        binance_raw = self._load_binance_window(
-            builder,
-            global_files.get("feeds.binance.tick"),
-            start_ts,
-            end_ts,
-        )
-        chainlink_raw = self._load_chainlink_window(
-            builder,
-            global_files.get("feeds.chainlink.tick"),
-            start_ts,
-            end_ts,
-        )
-        basis_raw = builder._align_basis_series(binance_raw, chainlink_raw)
-        global_payload = {
-            "binance": {"series": builder._downsample(binance_raw, builder.GLOBAL_MAX_POINTS)},
-            "chainlink": {"series": builder._downsample(chainlink_raw, builder.GLOBAL_MAX_POINTS)},
-            "basis": {"series": builder._downsample(basis_raw, builder.GLOBAL_MAX_POINTS)},
-        }
+        if isinstance(start_ts, int) and isinstance(end_ts, int) and end_ts > start_ts:
+            builder, global_files, _ = self._load_builder_and_files(current_signature)
+            binance_paths = self._select_stream_paths_for_window(
+                cache_key="feeds.binance.tick",
+                paths=global_files.get("feeds.binance.tick"),
+                start_ts=start_ts,
+                end_ts=end_ts,
+                ts_getter=lambda record: self._binance_record_ts(builder, record),
+            )
+            chainlink_paths = self._select_stream_paths_for_window(
+                cache_key="feeds.chainlink.tick",
+                paths=global_files.get("feeds.chainlink.tick"),
+                start_ts=start_ts,
+                end_ts=end_ts,
+                ts_getter=lambda record: self._chainlink_record_ts(builder, record),
+            )
+            binance_raw = self._load_binance_window(
+                builder,
+                binance_paths,
+                start_ts,
+                end_ts,
+            )
+            chainlink_raw = self._load_chainlink_window(
+                builder,
+                chainlink_paths,
+                start_ts,
+                end_ts,
+            )
+            basis_raw = builder._align_basis_series(binance_raw, chainlink_raw)
+            global_payload = {
+                "binance": {"series": builder._downsample(binance_raw, builder.GLOBAL_MAX_POINTS)},
+                "chainlink": {"series": builder._downsample(chainlink_raw, builder.GLOBAL_MAX_POINTS)},
+                "basis": {"series": builder._downsample(basis_raw, builder.GLOBAL_MAX_POINTS)},
+            }
+        else:
+            global_payload = {
+                "binance": {"series": []},
+                "chainlink": {"series": []},
+                "basis": {"series": []},
+            }
         body = json.dumps(
             {
                 "market_id": market_id,
@@ -536,9 +601,12 @@ class DashboardHTTPServer(ThreadingHTTPServer):
 
     def warm_cache(self) -> None:
         with self._cache_lock:
-            if self._building:
-                return
-        self._start_background_build(self._records_signature())
+            self._index_building = True
+        threading.Thread(
+            target=self._rebuild_index_body,
+            daemon=True,
+            name="dashboard-index-warmup",
+        ).start()
 
     def server_close(self) -> None:
         self._sync_gc_stop_event.set()
@@ -610,6 +678,9 @@ class DashboardHTTPServer(ThreadingHTTPServer):
             self._building = False
 
     def _records_signature(self) -> tuple[int, int]:
+        now = time.monotonic()
+        if self._sig_cache_val is not None and (now - self._sig_cache_ts) < self._sig_cache_ttl:
+            return self._sig_cache_val
         file_count = 0
         latest_mtime_ns = 0
         for path in self.records_root.rglob("*.jsonl"):
@@ -618,7 +689,10 @@ class DashboardHTTPServer(ThreadingHTTPServer):
             stat = path.stat()
             file_count += 1
             latest_mtime_ns = max(latest_mtime_ns, stat.st_mtime_ns)
-        return file_count, latest_mtime_ns
+        sig = (file_count, latest_mtime_ns)
+        self._sig_cache_val = sig
+        self._sig_cache_ts = now
+        return sig
 
     @staticmethod
     def _slice_global_section(section: dict, start_ts: int | None, end_ts: int | None) -> dict:
@@ -640,24 +714,51 @@ class DashboardHTTPServer(ThreadingHTTPServer):
         if self._live_signature == current_signature:
             return
         self._live_signature = current_signature
+        if self._index_body is not None:
+            self._stale_index_body = self._index_body
         self._index_body = None
         self._market_payloads = {}
         self._market_bodies = {}
         self._global_window_bodies = {}
+        self._live_global_files = None
+        self._live_market_files = None
+        self._stream_file_ranges = {}
 
-    def _load_builder_and_files(self):
+    def _load_builder_and_files(
+        self,
+        current_signature: tuple[int, int] | None = None,
+    ):
+        if current_signature is None:
+            current_signature = self._records_signature()
+        with self._cache_lock:
+            self._ensure_live_caches_current(current_signature)
+            cached_global_files = self._live_global_files
+            cached_market_files = self._live_market_files
+        if cached_global_files is not None and cached_market_files is not None:
+            return _load_builder_module(), cached_global_files, cached_market_files
+
         builder = _load_builder_module()
         global_files, market_files = builder._discover_record_files(self.records_root)
+        with self._cache_lock:
+            if self._live_signature == current_signature:
+                self._live_global_files = global_files
+                self._live_market_files = market_files
         return builder, global_files, market_files
 
-    def _build_live_index_payload(self) -> dict:
+    def _build_live_index_payload(self, offset: int = 0, limit: int = 50) -> dict:
         builder, _, market_files = self._load_builder_and_files()
+        # Sort by market_id numeric descending — no file reads required
+        all_ids = sorted(
+            market_files.keys(),
+            key=lambda mid: builder._safe_int(mid) or 0,
+            reverse=True,
+        )
+        total = len(all_ids)
+        page_ids = all_ids[offset:offset + limit]
         markets: dict[str, dict] = {}
-        market_rows: list[tuple[str, dict]] = []
-        for market_id, files in sorted(
-            market_files.items(),
-            key=lambda item: builder._safe_int(item[0]),
-        ):
+        market_order: list[str] = []
+        for market_id in page_ids:
+            files = market_files[market_id]
             market = self._build_live_index_market(builder, market_id, files)
             if market is None:
                 continue
@@ -666,23 +767,47 @@ class DashboardHTTPServer(ThreadingHTTPServer):
                 "window": market.get("window"),
                 "summary": market.get("summary"),
             }
-            market_rows.append((market_id, markets[market_id]))
-        market_rows.sort(
-            key=lambda item: builder._market_sort_key(item[0], item[1]),
-            reverse=True,
-        )
-        market_order = [market_id for market_id, _ in market_rows]
-        base_payload = {
+            market_order.append(market_id)
+        return {
             "generated_at": self._cache_payload.get("generated_at") if self._cache_payload else None,
             "records_root": str(self.records_root),
             "market_order": market_order,
+            "total": total,
+            "offset": offset,
+            "limit": limit,
+            "has_more": (offset + limit) < total,
             "global": self._cached_global_summary(),
             "markets": markets,
         }
-        return base_payload
+
+    @classmethod
+    def _read_last_market_metadata(cls, builder, paths) -> dict | None:
+        record = cls._read_last_jsonl_record(paths)
+        if record is None:
+            return None
+        market = record.get("payload", {}).get("market")
+        if not isinstance(market, dict):
+            return None
+        ref_price = builder._safe_float(market.get("reference_price"))
+        if ref_price is not None and not (10_000 <= abs(ref_price) <= 1_000_000):
+            ref_price = None
+        return {
+            "market_id": str(market.get("market_id") or ""),
+            "condition_id": str(market.get("condition_id") or ""),
+            "up_token_id": str(market.get("up_token_id") or ""),
+            "down_token_id": str(market.get("down_token_id") or ""),
+            "start_ts_ms": builder._safe_int(market.get("start_ts_ms")),
+            "end_ts_ms": builder._safe_int(market.get("end_ts_ms")),
+            "tick_size": builder._safe_float(market.get("tick_size")),
+            "fee_rate_bps": builder._safe_float(market.get("fee_rate_bps")),
+            "min_order_size": builder._safe_float(market.get("min_order_size")),
+            "status": str(market.get("status") or ""),
+            "reference_price": ref_price,
+            "raw_reference_price": builder._safe_float(market.get("reference_price")),
+        }
 
     def _build_live_index_market(self, builder, market_id: str, files: dict[str, list[Path]]) -> dict | None:
-        metadata = builder._load_market_metadata(files.get("market.metadata"), market_id)
+        metadata = self._read_last_market_metadata(builder, files.get("market.metadata"))
         if metadata is None:
             return None
 
@@ -794,7 +919,7 @@ class DashboardHTTPServer(ThreadingHTTPServer):
             if cached is not None:
                 return cached
 
-        builder, _, market_files = self._load_builder_and_files()
+        builder, _, market_files = self._load_builder_and_files(self._records_signature())
         files = market_files.get(market_id)
         if files is None:
             raise KeyError(market_id)
@@ -1244,13 +1369,21 @@ class DashboardHTTPServer(ThreadingHTTPServer):
         become unreachable once GC removes the file and it stops appearing in the
         manifest iteration.
         """
-        with self._sha256_cache_lock:
-            cached = self._sha256_cache.get(relative_path)
+        cache_lock = getattr(self, "_sha256_cache_lock", None)
+        if cache_lock is None:
+            cache_lock = threading.Lock()
+            self._sha256_cache_lock = cache_lock
+        cache = getattr(self, "_sha256_cache", None)
+        if cache is None:
+            cache = {}
+            self._sha256_cache = cache
+        with cache_lock:
+            cached = cache.get(relative_path)
             if cached and cached[0] == size_bytes and cached[1] == mtime_ns:
                 return cached[2]
         digest = self._file_sha256(path)
-        with self._sha256_cache_lock:
-            self._sha256_cache[relative_path] = (size_bytes, mtime_ns, digest)
+        with cache_lock:
+            cache[relative_path] = (size_bytes, mtime_ns, digest)
         return digest
 
     @staticmethod
@@ -1344,10 +1477,7 @@ class DashboardHTTPServer(ThreadingHTTPServer):
             paths=paths,
             start_ts=start_ts,
             end_ts=end_ts,
-            ts_getter=lambda record: builder._safe_int(
-                record.get("payload", {}).get("tick", {}).get("recv_ts_ms")
-                or record.get("payload", {}).get("tick", {}).get("event_ts_ms")
-            ),
+            ts_getter=lambda record: cls._binance_record_ts(builder, record),
             point_builder=lambda record: cls._build_binance_point(builder, record),
         )
 
@@ -1363,12 +1493,84 @@ class DashboardHTTPServer(ThreadingHTTPServer):
             paths=paths,
             start_ts=start_ts,
             end_ts=end_ts,
-            ts_getter=lambda record: builder._safe_int(
-                record.get("payload", {}).get("tick", {}).get("oracle_ts_ms")
-                or record.get("payload", {}).get("tick", {}).get("recv_ts_ms")
-            ),
+            ts_getter=lambda record: cls._chainlink_record_ts(builder, record),
             point_builder=lambda record: cls._build_chainlink_point(builder, record),
         )
+
+    @staticmethod
+    def _binance_record_ts(builder, record: dict) -> int | None:
+        return builder._safe_int(
+            record.get("payload", {}).get("tick", {}).get("recv_ts_ms")
+            or record.get("payload", {}).get("tick", {}).get("event_ts_ms")
+        )
+
+    @staticmethod
+    def _chainlink_record_ts(builder, record: dict) -> int | None:
+        return builder._safe_int(
+            record.get("payload", {}).get("tick", {}).get("oracle_ts_ms")
+            or record.get("payload", {}).get("tick", {}).get("recv_ts_ms")
+        )
+
+    def _select_stream_paths_for_window(
+        self,
+        *,
+        cache_key: str,
+        paths: list[Path] | Path | None,
+        start_ts: int | None,
+        end_ts: int | None,
+        ts_getter: Callable[[dict], int | None],
+    ) -> list[Path]:
+        normalized_paths = self._normalize_stream_paths(paths)
+        if not normalized_paths:
+            return []
+        if not isinstance(start_ts, int) or not isinstance(end_ts, int) or end_ts <= start_ts:
+            return []
+
+        stream_ranges = self._stream_ranges_for_paths(
+            cache_key=cache_key,
+            paths=normalized_paths,
+            ts_getter=ts_getter,
+        )
+        selected: list[Path] = []
+        for path, range_start, range_end in stream_ranges:
+            if isinstance(range_start, int) and range_start > end_ts:
+                break
+            if isinstance(range_end, int) and range_end < start_ts:
+                continue
+            if range_start is None and range_end is None:
+                selected.append(path)
+                continue
+            if isinstance(range_start, int) and isinstance(range_end, int):
+                if range_start <= end_ts and range_end >= start_ts:
+                    selected.append(path)
+                continue
+            selected.append(path)
+        return selected
+
+    def _stream_ranges_for_paths(
+        self,
+        *,
+        cache_key: str,
+        paths: list[Path],
+        ts_getter: Callable[[dict], int | None],
+    ) -> list[tuple[Path, int | None, int | None]]:
+        path_key = tuple(str(path) for path in paths)
+        with self._cache_lock:
+            cached = self._stream_file_ranges.get(cache_key)
+            if cached is not None and cached[0] == path_key:
+                return cached[1]
+
+        ranges = [
+            (
+                path,
+                self._read_first_record_ts(path, ts_getter),
+                self._read_last_record_ts(path, ts_getter),
+            )
+            for path in paths
+        ]
+        with self._cache_lock:
+            self._stream_file_ranges[cache_key] = (path_key, ranges)
+        return ranges
 
     @staticmethod
     def _build_binance_point(builder, record: dict) -> dict | None:
@@ -1505,6 +1707,33 @@ class DashboardHTTPServer(ThreadingHTTPServer):
             except json.JSONDecodeError:
                 continue
             return record_offset, next_offset, record
+
+    @staticmethod
+    def _read_first_record_ts(path: Path, ts_getter: Callable[[dict], int | None]) -> int | None:
+        with path.open("rb") as handle:
+            while True:
+                raw_line = handle.readline()
+                if not raw_line:
+                    return None
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                ts = ts_getter(record)
+                if isinstance(ts, int):
+                    return ts
+        return None
+
+    @classmethod
+    def _read_last_record_ts(cls, path: Path, ts_getter: Callable[[dict], int | None]) -> int | None:
+        record = cls._read_last_jsonl_record(path)
+        if record is None:
+            return None
+        ts = ts_getter(record)
+        return ts if isinstance(ts, int) else None
 
 
 def _parse_args() -> argparse.Namespace:

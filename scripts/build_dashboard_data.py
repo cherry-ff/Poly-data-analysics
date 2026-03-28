@@ -58,9 +58,8 @@ def _parse_args() -> argparse.Namespace:
 def build_dashboard_payload(records_root: Path) -> dict[str, Any]:
     global_files, market_files = _discover_record_files(records_root)
 
-    binance_raw = _load_binance_series(global_files.get("feeds.binance.tick"))
-    chainlink_raw = _load_chainlink_series(global_files.get("feeds.chainlink.tick"))
-    basis_raw = _align_basis_series(binance_raw["raw"], chainlink_raw["raw"])
+    binance_latest = _load_binance_latest(global_files.get("feeds.binance.tick"))
+    chainlink_latest = _load_chainlink_latest(global_files.get("feeds.chainlink.tick"))
 
     markets: dict[str, dict[str, Any]] = {}
     market_rows: list[tuple[str, dict[str, Any]]] = []
@@ -74,8 +73,8 @@ def build_dashboard_payload(records_root: Path) -> dict[str, Any]:
             market_id=market_id,
             files=files,
             metadata=metadata,
-            binance_raw=binance_raw["raw"],
-            chainlink_raw=chainlink_raw["raw"],
+            binance_raw=[],
+            chainlink_raw=[],
         )
         if not _market_has_dashboard_data(market):
             continue
@@ -94,13 +93,9 @@ def build_dashboard_payload(records_root: Path) -> dict[str, Any]:
         "records_root": str(records_root),
         "market_order": market_order,
         "global": {
-            "binance": _global_payload(binance_raw, GLOBAL_MAX_POINTS),
-            "chainlink": _global_payload(chainlink_raw, GLOBAL_MAX_POINTS),
-            "basis": {
-                "count": len(basis_raw),
-                "latest": basis_raw[-1] if basis_raw else None,
-                "series": _downsample(basis_raw, GLOBAL_MAX_POINTS),
-            },
+            "binance": {"count": None, "latest": binance_latest, "series": []},
+            "chainlink": {"count": None, "latest": chainlink_latest, "series": []},
+            "basis": {"count": None, "latest": None, "series": []},
         },
         "markets": markets,
     }
@@ -593,6 +588,60 @@ def _load_latest_depth(
     if count == 0:
         return {"count": 0, "latest": None}
     return {"count": count, "latest": latest}
+
+
+def _read_last_stream_record(paths: list[Path] | Path | None) -> dict[str, Any] | None:
+    for path in reversed(_normalize_stream_paths(paths)):
+        with path.open("rb") as handle:
+            handle.seek(0, 2)
+            file_size = handle.tell()
+            if file_size <= 0:
+                continue
+            chunk_size = min(8192, file_size)
+            handle.seek(file_size - chunk_size)
+            tail = handle.read()
+            for line in reversed(tail.splitlines()):
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                try:
+                    return json.loads(stripped)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+    return None
+
+
+def _load_binance_latest(paths: list[Path] | Path | None) -> dict[str, Any] | None:
+    record = _read_last_stream_record(paths)
+    if record is None:
+        return None
+    tick = record.get("payload", {}).get("tick")
+    if not isinstance(tick, dict):
+        return None
+    bid = _safe_float(tick.get("best_bid"))
+    ask = _safe_float(tick.get("best_ask"))
+    return {
+        "ts": _safe_int(tick.get("recv_ts_ms") or tick.get("event_ts_ms")),
+        "last": _safe_float(tick.get("last_price")),
+        "bid": bid,
+        "ask": ask,
+        "mid": _mid(bid, ask),
+    }
+
+
+def _load_chainlink_latest(paths: list[Path] | Path | None) -> dict[str, Any] | None:
+    record = _read_last_stream_record(paths)
+    if record is None:
+        return None
+    tick = record.get("payload", {}).get("tick")
+    if not isinstance(tick, dict):
+        return None
+    return {
+        "ts": _safe_int(tick.get("oracle_ts_ms") or tick.get("recv_ts_ms")),
+        "price": _safe_float(tick.get("price")),
+        "bid": _safe_float(tick.get("bid")),
+        "ask": _safe_float(tick.get("ask")),
+    }
 
 
 def _load_binance_series(paths: list[Path] | Path | None) -> dict[str, Any]:
