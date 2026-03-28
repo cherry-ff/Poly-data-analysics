@@ -454,6 +454,7 @@ class DashboardHTTPServer(ThreadingHTTPServer):
         self._live_global: dict | None = None
         self._live_global_ts: float = 0.0
         self._live_global_ttl: float = 5.0
+        self._load_sha256_cache()
         self._load_snapshot()
         self.warm_cache()
         self._start_sync_gc_thread()
@@ -968,10 +969,14 @@ class DashboardHTTPServer(ThreadingHTTPServer):
         sync_root = self._sync_root()
         entries = []
         total_bytes = 0
+        cache_size_before = len(getattr(self, "_sha256_cache", {}))
         for path in self._iter_syncable_files():
             entry = self._build_sync_manifest_entry(path, sync_root)
             total_bytes += entry["size_bytes"]
             entries.append(entry)
+        # Persist any newly-computed sha256 entries so the next restart is instant.
+        if len(getattr(self, "_sha256_cache", {})) > cache_size_before:
+            threading.Thread(target=self._save_sha256_cache, daemon=True, name="sha256-cache-save").start()
         return {
             "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             "records_root": str(self.records_root),
@@ -1385,15 +1390,49 @@ class DashboardHTTPServer(ThreadingHTTPServer):
     def _parse_utc_ts(value: str) -> datetime:
         return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc)
 
+    def _sha256_cache_path(self) -> Path:
+        return self.sync_state_dir / "sha256_cache.json"
+
+    def _load_sha256_cache(self) -> None:
+        """Restore persisted sha256 cache from disk so manifest requests are fast after restart."""
+        path = self._sha256_cache_path()
+        if not path.exists():
+            return
+        try:
+            data = json.loads(path.read_text("utf-8"))
+            with self._sha256_cache_lock:
+                for rel, entry in data.items():
+                    if isinstance(entry, list) and len(entry) == 3:
+                        self._sha256_cache[rel] = (int(entry[0]), int(entry[1]), str(entry[2]))
+        except Exception:
+            pass
+
+    def _save_sha256_cache(self) -> None:
+        """Atomically persist the in-memory sha256 cache to disk."""
+        if not hasattr(self, "sync_state_dir"):
+            return
+        path = self._sha256_cache_path()
+        cache_lock = getattr(self, "_sha256_cache_lock", None)
+        if cache_lock is None:
+            return
+        with cache_lock:
+            data = {rel: list(entry) for rel, entry in self._sha256_cache.items()}
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data), "utf-8")
+            tmp.replace(path)
+        except Exception:
+            pass
+
     def _file_sha256_cached(
         self, relative_path: str, path: Path, size_bytes: int, mtime_ns: int
     ) -> str:
-        """Return sha256 for a sealed file, using an in-memory cache.
+        """Return sha256 for a sealed file, using an in-memory cache backed by disk.
 
         Sealed files are immutable after rotate, so (size_bytes, mtime_ns) is a
-        stable cache key.  The cache is never explicitly invalidated; entries just
-        become unreachable once GC removes the file and it stops appearing in the
-        manifest iteration.
+        stable cache key.  The cache is persisted to disk so it survives restarts —
+        without this, every restart forces a full re-read of all GB-scale sealed files.
         """
         cache_lock = getattr(self, "_sha256_cache_lock", None)
         if cache_lock is None:
