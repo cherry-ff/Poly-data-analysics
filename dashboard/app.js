@@ -299,9 +299,9 @@ function renderGlobalStats() {
   const global = payload.global;
   const cards = [
     statCard("市场数量", String(state.totalMarkets || state.allMarketOrder.length), "已解析的 numeric market"),
-    statCard("Binance 最新中间价", formatMetric(global.binance.latest?.mid, "price"), `${global.binance.count} records`),
-    statCard("Chainlink 最新价格", formatMetric(global.chainlink.latest?.price, "price"), `${global.chainlink.count} records`),
-    statCard("最新 Basis", formatMetric(global.basis.latest?.basis, "basis"), `${global.basis.count} aligned points`),
+    statCard("Binance 最新中间价", formatMetric(global.binance?.latest?.mid, "price"), `${global.binance?.count ?? "—"} records`),
+    statCard("Chainlink 最新价格", formatMetric(global.chainlink?.latest?.price, "price"), `${global.chainlink?.count ?? "—"} records`),
+    statCard("最新 Basis", formatMetric(global.basis?.latest?.basis, "basis"), `${global.basis?.count ?? "—"} aligned points`),
   ];
   document.getElementById("global-stats").innerHTML = cards.join("");
 }

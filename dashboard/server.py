@@ -141,6 +141,17 @@ class DashboardRequestHandler(SimpleHTTPRequestHandler):
     def _serve_dashboard_json(self) -> None:
         try:
             body = self.server.dashboard_body()
+        except RuntimeError as exc:
+            # Snapshot is being built in the background — tell the client to retry.
+            body = json.dumps(
+                {"status": "building", "detail": str(exc)}, indent=2
+            ).encode("utf-8")
+            self.send_response(202)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         except Exception as exc:
             self._serve_error(exc)
             return
@@ -439,6 +450,10 @@ class DashboardHTTPServer(ThreadingHTTPServer):
         self._sig_cache_val: tuple[int, int] | None = None
         self._sig_cache_ts: float = 0.0
         self._sig_cache_ttl: float = 2.0
+        # Live global summary (binance/chainlink latest) — TTL-cached, independent of snapshot
+        self._live_global: dict | None = None
+        self._live_global_ts: float = 0.0
+        self._live_global_ttl: float = 5.0
         self._load_snapshot()
         self.warm_cache()
         self._start_sync_gc_thread()
@@ -468,11 +483,10 @@ class DashboardHTTPServer(ThreadingHTTPServer):
         with self._cache_lock:
             if self._cache_body is not None:
                 return self._cache_body
-        self.dashboard_payload()
-        with self._cache_lock:
-            if self._cache_body is not None:
-                return self._cache_body
-            raise RuntimeError(self._build_error or "dashboard cache unavailable")
+        # Snapshot not in memory — trigger a background build and tell the caller to retry.
+        # Never block the request thread for the full 337-second rebuild.
+        self._start_background_build(self._records_signature())
+        raise RuntimeError("snapshot build in progress — retry in a few minutes")
 
     def dashboard_index_body(self, offset: int = 0, limit: int = 50) -> bytes:
         current_signature = self._records_signature()
@@ -723,6 +737,7 @@ class DashboardHTTPServer(ThreadingHTTPServer):
         self._live_global_files = None
         self._live_market_files = None
         self._stream_file_ranges = {}
+        self._live_global = None
 
     def _load_builder_and_files(
         self,
@@ -769,14 +784,14 @@ class DashboardHTTPServer(ThreadingHTTPServer):
             }
             market_order.append(market_id)
         return {
-            "generated_at": self._cache_payload.get("generated_at") if self._cache_payload else None,
+            "generated_at": None,
             "records_root": str(self.records_root),
             "market_order": market_order,
             "total": total,
             "offset": offset,
             "limit": limit,
             "has_more": (offset + limit) < total,
-            "global": self._cached_global_summary(),
+            "global": self._fetch_live_global_summary(),
             "markets": markets,
         }
 
@@ -900,18 +915,29 @@ class DashboardHTTPServer(ThreadingHTTPServer):
             return None
         return market
 
-    def _cached_global_summary(self) -> dict:
-        global_payload = self._cache_payload.get("global", {}) if self._cache_payload else {}
-        if not isinstance(global_payload, dict):
-            global_payload = {}
-        return {
-            key: {
-                "count": value.get("count"),
-                "latest": value.get("latest"),
-            }
-            for key, value in global_payload.items()
-            if isinstance(value, dict)
+    def _fetch_live_global_summary(self) -> dict:
+        """Return binance/chainlink latest by reading only the last record — fast, no snapshot needed.
+
+        Result is TTL-cached for _live_global_ttl seconds so concurrent index-page requests
+        don't all hit disk simultaneously.
+        """
+        now = time.monotonic()
+        with self._cache_lock:
+            if self._live_global is not None and (now - self._live_global_ts) < self._live_global_ttl:
+                return self._live_global
+
+        builder, global_files, _ = self._load_builder_and_files()
+        binance_latest = builder._load_binance_latest(global_files.get("feeds.binance.tick"))
+        chainlink_latest = builder._load_chainlink_latest(global_files.get("feeds.chainlink.tick"))
+        summary: dict = {
+            "binance": {"count": None, "latest": binance_latest},
+            "chainlink": {"count": None, "latest": chainlink_latest},
+            "basis": {"count": None, "latest": None},
         }
+        with self._cache_lock:
+            self._live_global = summary
+            self._live_global_ts = now
+        return summary
 
     def _get_live_market_payload(self, market_id: str) -> dict:
         with self._cache_lock:
@@ -1427,6 +1453,12 @@ class DashboardHTTPServer(ThreadingHTTPServer):
             raise ValueError(f"sync entry size changed before delete: {relative_path}")
 
     def _refresh_after_records_mutation(self) -> None:
+        """Invalidate all caches after a sync mutation, then kick off non-blocking rebuilds.
+
+        Previously this called _rebuild_cache() synchronously (337 s on large datasets).
+        Now it just clears state and lets background threads regenerate the snapshot and
+        the live index independently, so sync endpoints return immediately.
+        """
         with self._cache_lock:
             self._live_signature = None
             self._cache_signature = None
@@ -1436,9 +1468,20 @@ class DashboardHTTPServer(ThreadingHTTPServer):
             self._market_payloads = {}
             self._market_bodies = {}
             self._global_window_bodies = {}
+            self._live_global = None
             self._build_error = None
-            self._building = True
-        self._rebuild_cache(self._records_signature())
+        sig = self._records_signature()
+        # Rebuild snapshot in background (writes market-dashboard.json when done).
+        self._start_background_build(sig)
+        # Also kick off a live index rebuild so the first index request is instant.
+        with self._cache_lock:
+            if not self._index_building:
+                self._index_building = True
+                threading.Thread(
+                    target=self._rebuild_index_body,
+                    daemon=True,
+                    name="dashboard-index-refresh",
+                ).start()
 
     @staticmethod
     def _read_last_jsonl_record(paths: list[Path] | Path | None) -> dict | None:
