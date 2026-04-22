@@ -10,3 +10,8 @@ runtime_data/
 *-run/
 local_sync_client/synced_records/
 dashboard/data/market-dashboard.json
+
+# analysis outputs (generated, large binary files)
+analysis/output/
+*.tar.gz
+.idea/
